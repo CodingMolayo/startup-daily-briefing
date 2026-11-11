@@ -3,38 +3,40 @@ import os
 import re
 import json
 import html
-import time
-import calendar
 import logging
+import calendar
 import smtplib
 import feedparser
 
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from groq import Groq
+from email.mime.text import MIMEText
+
+from google import genai
+from google.genai import types
 
 
-# ==========================================
+# ============================================================
 # 1. 기본 설정
-# ==========================================
+# ============================================================
 
-KST = ZoneInfo("Asia/Seoul")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 
-GROQ_MODEL = os.environ.get(
-    "GROQ_MODEL",
-    "openai/gpt-oss-120b"
-)
+KST = ZoneInfo("Asia/Seoul")
 
 MAX_AGE_HOURS = 72
 MAX_ARTICLES = 40
 ARTICLES_PER_FEED = 8
+
 HISTORY_FILE = "processed_articles.json"
 
 logging.basicConfig(
@@ -42,237 +44,132 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+logger = logging.getLogger(__name__)
 
-# ==========================================
-# 2. 뉴스 수집원
-# ==========================================
 
-def google_news_url(query, language="ko", country="KR"):
-    """Google News RSS 검색 주소 생성"""
+# ============================================================
+# 2. 뉴스 수집 대상
+# ============================================================
+
+def google_news_rss(query, language="ko"):
+    """
+    Google News RSS 검색 주소 생성
+    최근 3일 이내 기사 검색
+    """
+
+    encoded_query = quote_plus(query + " when:3d")
 
     if language == "en":
         return (
-            "https://news.google.com/rss/search?q="
-            + quote_plus(query + " when:3d")
-            + "&hl=en-US&gl=US&ceid=US:en"
+            "https://news.google.com/rss/search?"
+            f"q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
         )
 
     return (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(query + " when:3d")
-        + "&hl=ko&gl=KR&ceid=KR:ko"
+        "https://news.google.com/rss/search?"
+        f"q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     )
 
 
 RSS_FEEDS = [
-    # 국내 전문 언론
-    (
-        "벤처스퀘어 뉴스",
-        "https://www.venturesquare.net/rss/news"
-    ),
-    (
-        "벤처스퀘어 인터뷰",
-        "https://www.venturesquare.net/rss/interview"
-    ),
-    (
-        "벤처스퀘어 트렌드",
-        "https://www.venturesquare.net/rss/trend"
-    ),
+    {
+        "name": "벤처스퀘어 뉴스",
+        "url": "https://www.venturesquare.net/rss/news"
+    },
+    {
+        "name": "벤처스퀘어 인터뷰",
+        "url": "https://www.venturesquare.net/rss/interview"
+    },
+    {
+        "name": "벤처스퀘어 트렌드",
+        "url": "https://www.venturesquare.net/rss/trend"
+    },
 
-    # 관심 투자사
-    (
-        "매쉬업벤처스 관련 뉴스",
-        google_news_url('"매쉬업벤처스" 투자 OR 포트폴리오')
-    ),
-    (
-        "소풍벤처스 관련 뉴스",
-        google_news_url('"소풍벤처스" 투자 OR 임팩트 OR 포트폴리오')
-    ),
-    (
-        "MYSC 관련 뉴스",
-        google_news_url('"MYSC" 임팩트 투자 OR 포트폴리오')
-    ),
-    (
-        "블루포인트 관련 뉴스",
-        google_news_url('"블루포인트파트너스" 투자 OR 포트폴리오')
-    ),
-    (
-        "알토스벤처스 관련 뉴스",
-        google_news_url('"알토스벤처스" 투자 OR 포트폴리오')
-    ),
-    (
-        "Y Combinator 관련 뉴스",
-        google_news_url(
-            '"Y Combinator" startup investment portfolio',
+    # 국내 주요 투자사
+    {
+        "name": "매쉬업벤처스",
+        "url": google_news_rss("매쉬업벤처스 투자")
+    },
+    {
+        "name": "소풍벤처스",
+        "url": google_news_rss("소풍벤처스 투자")
+    },
+    {
+        "name": "MYSC",
+        "url": google_news_rss("MYSC 투자")
+    },
+    {
+        "name": "블루포인트파트너스",
+        "url": google_news_rss("블루포인트파트너스 투자")
+    },
+    {
+        "name": "알토스벤처스",
+        "url": google_news_rss("알토스벤처스 투자")
+    },
+
+    # 글로벌 투자사
+    {
+        "name": "Y Combinator",
+        "url": google_news_rss(
+            '"Y Combinator" startup funding',
             language="en"
         )
-    ),
+    },
 
     # 관심 산업
-    (
-        "환경 및 기후테크",
-        google_news_url("기후테크 환경 스타트업 투자 유치")
-    ),
-    (
-        "핀테크",
-        google_news_url("핀테크 금융 스타트업 투자 유치")
-    ),
-    (
-        "임팩트 투자",
-        google_news_url("임팩트 투자 소셜벤처 투자 유치")
-    ),
-    (
-        "인프라",
-        google_news_url("인프라 에너지 물류 스타트업 투자")
-    ),
-    (
-        "콘텐츠",
-        google_news_url("콘텐츠 플랫폼 창작자 스타트업 투자")
-    ),
-
-    # 국내외 투자 이벤트
-    (
-        "스타트업 투자 유치",
-        google_news_url("스타트업 시리즈 A B C 투자 유치")
-    ),
-    (
-        "글로벌 임팩트 투자",
-        google_news_url(
-            "impact investing climate tech fintech startup funding",
+    {
+        "name": "기후·환경",
+        "url": google_news_rss(
+            "기후테크 환경테크 스타트업 투자"
+        )
+    },
+    {
+        "name": "핀테크",
+        "url": google_news_rss(
+            "핀테크 스타트업 투자"
+        )
+    },
+    {
+        "name": "임팩트 투자",
+        "url": google_news_rss(
+            "임팩트 투자 소셜벤처"
+        )
+    },
+    {
+        "name": "인프라",
+        "url": google_news_rss(
+            "인프라 스타트업 투자"
+        )
+    },
+    {
+        "name": "콘텐츠",
+        "url": google_news_rss(
+            "콘텐츠 스타트업 투자"
+        )
+    },
+    {
+        "name": "국내 스타트업 투자",
+        "url": google_news_rss(
+            "스타트업 투자 유치 시리즈A 시리즈B"
+        )
+    },
+    {
+        "name": "글로벌 임팩트 투자",
+        "url": google_news_rss(
+            "impact investing startup funding",
             language="en"
         )
-    )
+    }
 ]
 
 
-# ==========================================
-# 3. 뉴스 데이터 정리
-# ==========================================
-
-def clean_text(text):
-    """HTML 태그 및 불필요한 공백 제거"""
-
-    text = re.sub(r"<[^>]+>", " ", str(text))
-    text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def get_entry_date(entry):
-    """기사 발행일을 UTC 기준으로 변환"""
-
-    parsed = (
-        entry.get("published_parsed")
-        or entry.get("updated_parsed")
-    )
-
-    if not parsed:
-        return None
-
-    timestamp = calendar.timegm(parsed)
-
-    return datetime.fromtimestamp(
-        timestamp,
-        timezone.utc
-    )
-
-
-def fetch_latest_news(processed_urls):
-    """RSS에서 최신 뉴스 수집 및 중복 제거"""
-
-    articles = []
-    seen_urls = set()
-    seen_titles = set()
-
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        hours=MAX_AGE_HOURS
-    )
-
-    for source_name, url in RSS_FEEDS:
-
-        try:
-            logging.info("뉴스 수집: %s", source_name)
-
-            feed = feedparser.parse(url)
-
-            for entry in feed.entries[:ARTICLES_PER_FEED]:
-
-                link = entry.get("link", "").strip()
-                title = clean_text(entry.get("title", ""))
-
-                if not link or not title:
-                    continue
-
-                if link in processed_urls or link in seen_urls:
-                    continue
-
-                normalized_title = re.sub(
-                    r"[^가-힣a-zA-Z0-9]",
-                    "",
-                    title
-                ).lower()
-
-                if normalized_title in seen_titles:
-                    continue
-
-                published = get_entry_date(entry)
-
-                # 날짜가 확인되지 않으면 분석 대상에서 제외
-                if published is None or published < cutoff:
-                    continue
-
-                summary = clean_text(
-                    entry.get("summary", "")
-                )
-
-                if not summary and entry.get("content"):
-                    summary = clean_text(
-                        entry.content[0].get("value", "")
-                    )
-
-                article_id = f"A{len(articles) + 1:02d}"
-
-                articles.append({
-                    "id": article_id,
-                    "source": source_name,
-                    "title": title,
-                    "url": link,
-                    "published": published.isoformat(),
-                    "summary": summary[:700]
-                })
-
-                seen_urls.add(link)
-                seen_titles.add(normalized_title)
-
-        except Exception as error:
-            logging.warning(
-                "%s 수집 실패: %s",
-                source_name,
-                error
-            )
-
-    articles.sort(
-        key=lambda x: x["published"],
-        reverse=True
-    )
-
-    articles = articles[:MAX_ARTICLES]
-
-    # ID를 최종 목록 기준으로 다시 정렬
-    for index, article in enumerate(articles, 1):
-        article["id"] = f"A{index:02d}"
-
-    logging.info("최종 수집 기사: %s개", len(articles))
-
-    return articles
-
-
-# ==========================================
-# 4. 기존 수집 기록 관리
-# ==========================================
+# ============================================================
+# 3. 기사 처리 이력
+# ============================================================
 
 def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return set()
 
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as file:
@@ -280,20 +177,14 @@ def load_history():
 
         return set(data.get("processed_urls", []))
 
-    except FileNotFoundError:
-        return set()
-
     except Exception as error:
-        logging.warning("기존 기록을 읽지 못했습니다: %s", error)
+        logger.warning("이력 파일을 읽지 못했습니다: %s", error)
         return set()
 
 
 def save_history(processed_urls):
-
     data = {
-        "processed_urls": sorted(
-            list(processed_urls)[-500:]
-        )
+        "processed_urls": list(processed_urls)[-500:]
     }
 
     with open(HISTORY_FILE, "w", encoding="utf-8") as file:
@@ -305,380 +196,569 @@ def save_history(processed_urls):
         )
 
 
-# ==========================================
-# 5. AI 투자 분석
-# ==========================================
+# ============================================================
+# 4. RSS 뉴스 수집
+# ============================================================
 
-def analyze_with_groq(articles):
+def clean_html(text):
+    if not text:
+        return ""
 
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY가 등록되지 않았습니다.")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
 
-    client = Groq(api_key=GROQ_API_KEY)
+    return text.strip()
 
-    news_text = json.dumps(
+
+def fetch_latest_news(processed_urls):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=MAX_AGE_HOURS)
+
+    articles = []
+    seen_urls = set()
+    seen_titles = set()
+
+    for feed_info in RSS_FEEDS:
+        feed_name = feed_info["name"]
+        feed_url = feed_info["url"]
+
+        try:
+            feed = feedparser.parse(feed_url)
+
+            if feed.bozo:
+                logger.warning(
+                    "RSS 파싱 경고 (%s): %s",
+                    feed_name,
+                    feed.bozo_exception
+                )
+
+            entries = feed.entries[:ARTICLES_PER_FEED]
+
+            for entry in entries:
+                url = entry.get("link", "").strip()
+                title = clean_html(entry.get("title", ""))
+
+                if not url or not title:
+                    continue
+
+                if url in processed_urls or url in seen_urls:
+                    continue
+
+                normalized_title = re.sub(
+                    r"\s+", "", title.lower()
+                )
+
+                if normalized_title in seen_titles:
+                    continue
+
+                published = entry.get("published_parsed")
+
+                if not published:
+                    published = entry.get("updated_parsed")
+
+                if not published:
+                    continue
+
+                published_timestamp = calendar.timegm(published)
+
+                published_utc = datetime.fromtimestamp(
+                    published_timestamp,
+                    tz=timezone.utc
+                )
+
+                if published_utc < cutoff:
+                    continue
+
+                summary = clean_html(
+                    entry.get("summary", "")
+                )
+
+                if not summary:
+                    summary = clean_html(
+                        entry.get("description", "")
+                    )
+
+                article = {
+                    "id": f"A{len(articles) + 1:03d}",
+                    "source": feed_name,
+                    "title": title,
+                    "url": url,
+                    "published": published_utc.astimezone(
+                        KST
+                    ).strftime("%Y-%m-%d %H:%M"),
+                    "summary": summary[:700]
+                }
+
+                articles.append(article)
+
+                seen_urls.add(url)
+                seen_titles.add(normalized_title)
+
+                if len(articles) >= MAX_ARTICLES:
+                    break
+
+            logger.info(
+                "%s: %d개 기사 확인",
+                feed_name,
+                len(entries)
+            )
+
+        except Exception:
+            logger.exception(
+                "RSS 수집 실패: %s",
+                feed_name
+            )
+
+        if len(articles) >= MAX_ARTICLES:
+            break
+
+    logger.info("최종 수집 기사 수: %d", len(articles))
+
+    return articles
+
+
+# ============================================================
+# 5. Gemini 분석
+# ============================================================
+
+def analyze_news_with_gemini(articles):
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
+
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+    articles_json = json.dumps(
         articles,
         ensure_ascii=False,
         indent=2
     )
 
     prompt = f"""
-너는 초기 스타트업 투자, 임팩트 투자, 엔젤투자에
-전문성을 가진 투자 리서치 애널리스트다.
+당신은 벤처캐피털(VC), 액셀러레이터(AC),
+엔젤투자자의 관점에서 스타트업과 임팩트 투자를 분석하는
+전문 리서치 애널리스트입니다.
 
-다음은 최근 72시간 동안 수집한 뉴스 데이터다.
+아래 기사 데이터를 분석하고 한국어 투자 브리핑을 작성하세요.
 
-[뉴스 데이터]
-{news_text}
+[분석 목적]
 
-[사용자의 투자 배경]
+사용자는 향후 VC, AC, 엔젤투자조합 등에서
+투자 관련 업무를 수행할 수 있는 역량을 쌓고자 합니다.
 
-- 창업 실패 경험: 콘텐츠 큐레이팅 플랫폼
-- 액셀러레이터 배치 참여 경험
-- 엔젤투자평가사 2급
-- 스타트업 투자 실무 지식은 입문 수준
-- 관심 산업: 환경, 핀테크, 임팩트 투자, 인프라, 콘텐츠
-- 관심 투자사: 매쉬업벤처스, 소풍벤처스,
-  MYSC, 블루포인트파트너스, 알토스벤처스,
-  Y Combinator
+관심 산업:
+- 환경 및 기후테크
+- 핀테크
+- 임팩트 투자
+- 인프라
+- 콘텐츠
 
-[투자 철학]
+관심 투자사:
+- 매쉬업벤처스
+- 소풍벤처스
+- MYSC
+- Y Combinator
+- 블루포인트파트너스
+- 알토스벤처스
 
-자본주의의 구조적 문제를 인식하며,
-기존 시스템의 문제에 균열을 만들 수 있는
-기업과 사업 모델에 관심이 있다.
+[중요한 분석 원칙]
 
-다음 관점으로 분석한다.
+1. 기사에 명시된 사실과 AI의 추론을 반드시 구분하세요.
+2. 기사에 없는 매출, 고객 수, 투자 금액, 기업 실적을
+   절대로 만들어내지 마세요.
+3. 확인할 수 없는 내용은 "확인되지 않음"이라고 표시하세요.
+4. 투자 유치와 실제 투자 집행을 혼동하지 마세요.
+5. 단순 기사 요약보다 투자자가 주목해야 할 이유를 설명하세요.
+6. 투자사의 투자 배경은 가설로 제시하고 근거를 설명하세요.
+7. 리스크는 사업성, 시장성, 경쟁, 규제, 수익성,
+   임팩트 측정 측면에서 검토하세요.
+8. 각 분석에는 근거가 된 기사 ID를 반드시 포함하세요.
+9. 기사에 없는 내용을 사실처럼 단정하지 마세요.
+10. 관련성이 낮은 기사는 억지로 투자 이벤트로 분류하지 마세요.
 
-1. 경제적 지속 가능성
-2. 사회적·환경적 임팩트
-3. 기존 경제 구조의 변화 가능성
-4. 엔젤투자자 관점의 투자 리스크
+[요청하는 분석]
 
-[분석 원칙]
+1. 오늘의 핵심 요약
+   - 가장 중요한 시장 변화
+   - 주목할 투자 이벤트
+   - 투자자가 기억해야 할 핵심 메시지
 
-- 기사에 없는 매출, 투자금, 고객 수 등을 만들지 마라.
-- 사실과 분석 가설을 반드시 구분하라.
-- 투자 유치 배경은 확정적으로 표현하지 마라.
-- 공개된 정보가 부족하면 '확인 필요'라고 표시하라.
-- 투자사와 포트폴리오 기업의 관계를 정확하게 구분하라.
-- 단순 뉴스 요약보다 투자 관점의 해석에 집중하라.
-- 사회적 가치가 있다는 이유만으로 좋은 기업이라고 평가하지 마라.
-- 임팩트 워싱 가능성을 검토하라.
-- 각 분석에 사용한 뉴스의 ID를 반드시 표시하라.
-- 기사에 없는 사실을 근거로 삼지 마라.
-- 수익성과 임팩트 사이의 충돌 가능성도 분석하라.
+2. 투자 이벤트
+   - 투자 유치, 후속 투자, M&A, 신규 사업 등
+   - 투자 단계 및 투자 금액은 기사에 나온 경우에만 기재
+   - 투자 배경에 대한 가설
+   - 사업 모델과 성장 가능성
+   - 임팩트 관점의 의미
+   - 투자 리스크
+   - 추가로 확인해야 할 정보
+   - 관련 기사 ID
 
-[요청 결과]
+3. 시장 신호
+   - 여러 기사에서 반복적으로 드러나는 변화
+   - 산업의 성장 가능성 또는 위기
+   - 투자 자금의 흐름과 투자자 관심 변화
 
-다음 JSON 구조로만 출력하라.
+4. LinkedIn 포스팅 아이디어
+   - 사용자가 직접 글을 작성할 수 있도록
+     제목, 핵심 관점, 생각해 볼 질문 제시
+   - 완성된 게시글을 대신 작성하지 마세요.
+
+5. 투자 학습 노트
+   - 오늘 기사에서 배울 수 있는 투자 개념
+   - 초보 투자자가 이해해야 할 용어
+   - 실제 투자 검토에 적용할 질문
+
+[출력 형식]
+
+반드시 아래 JSON 구조를 따르세요.
+JSON 이외의 설명이나 Markdown 코드 펜스를 출력하지 마세요.
 
 {{
-  "daily_summary": "오늘 시장의 핵심 변화",
-
+  "daily_summary": "오늘의 핵심 요약",
   "investment_events": [
     {{
-      "title": "기업명 및 투자 이벤트",
-      "category": "투자 유치 / 후속 투자 / 산업 동향",
-      "source_ids": ["A01"],
-      "confirmed_facts": [
-        "기사에서 확인된 사실"
-      ],
-      "investment_hypotheses": [
-        "투자 집행 배경에 대한 가설"
-      ],
-      "impact_analysis": [
-        "사회적·환경적 임팩트 분석"
-      ],
-      "risks": [
-        "엔젤투자자 관점의 리스크"
-      ],
-      "unknowns": [
-        "추가로 확인해야 할 정보"
-      ],
-      "relevance_score": 5
+      "title": "이벤트 제목",
+      "category": "투자유치/후속투자/M&A/신사업/기타",
+      "source_ids": ["A001"],
+      "confirmed_facts": ["기사로 확인된 사실"],
+      "investment_hypotheses": ["투자 배경에 대한 가설"],
+      "impact_analysis": ["임팩트 관점의 분석"],
+      "risks": ["투자 리스크"],
+      "unknowns": ["추가 확인이 필요한 정보"],
+      "relevance_score": 1
     }}
   ],
-
   "market_signals": [
-    "오늘 발견한 시장 변화"
+    {{
+      "signal": "시장 신호",
+      "evidence": "근거",
+      "investment_implication": "투자 관점의 의미",
+      "source_ids": ["A001"]
+    }}
   ],
-
   "linkedin_ideas": [
     {{
-      "headline": "포스팅 소재 제목",
-      "angle": "어떤 관점으로 접근할 것인가",
+      "headline": "포스팅 제목",
+      "angle": "핵심 관점",
       "question": "독자에게 던질 질문",
-      "source_ids": ["A01"]
+      "source_ids": ["A001"]
     }}
   ],
-
   "learning_notes": [
-    "오늘 새롭게 알아두면 좋은 투자 관련 개념"
+    {{
+      "concept": "투자 개념",
+      "explanation": "개념 설명",
+      "application": "실제 투자 검토에서의 활용"
+    }}
   ]
 }}
 
-[작성 기준]
+relevance_score는 1~5 사이의 정수입니다.
+관련성이 낮은 이벤트는 제외하세요.
 
-- 투자 이벤트는 최대 5개
-- 링크드인 소재는 3개
-- 시장 시그널은 최대 5개
-- 학습 노트는 최대 3개
-- relevance_score는 1~5점
-- source_ids는 반드시 제공된 기사 ID만 사용
-- 기사 내용이 불충분하면 억지로 분석하지 말 것
-- 유효한 JSON 이외의 문장은 출력하지 말 것
+[분석 대상 기사]
+
+{articles_json}
 """
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "너는 신중하고 비판적인 임팩트 투자 리서치 "
-                    "애널리스트다. 근거 없는 사실을 만들지 않는다."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        max_completion_tokens=7000
+    logger.info(
+        "Gemini 분석 시작: 모델 %s",
+        GEMINI_MODEL
     )
 
-    result = response.choices[0].message.content
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=7000,
+            thinking_config=types.ThinkingConfig(
+                thinking_level="low"
+            )
+        )
+    )
 
-    if not result:
-        raise ValueError("AI 응답이 비어 있습니다.")
+    response_text = response.text
 
-    # JSON 이외의 설명이나 코드 펜스가 붙었을 경우 처리
-    result = result.strip()
-    result = re.sub(r"^```(?:json)?\s*", "", result)
-    result = re.sub(r"\s*```$", "", result)
+    if not response_text:
+        raise ValueError("Gemini가 비어 있는 응답을 반환했습니다.")
 
-    start = result.find("{")
-    end = result.rfind("}")
+    # JSON 파싱
+    response_text = response_text.strip()
 
-    if start < 0 or end < start:
-        raise ValueError("AI 응답에서 JSON을 찾을 수 없습니다.")
+    response_text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        response_text
+    )
 
-    return json.loads(result[start:end + 1])
+    response_text = re.sub(
+        r"\s*```$",
+        "",
+        response_text
+    )
+
+    try:
+        result = json.loads(response_text)
+
+    except json.JSONDecodeError:
+        start = response_text.find("{")
+        end = response_text.rfind("}")
+
+        if start == -1 or end == -1:
+            raise ValueError(
+                "Gemini 응답에서 JSON을 찾을 수 없습니다."
+            )
+
+        result = json.loads(
+            response_text[start:end + 1]
+        )
+
+    if not isinstance(result, dict):
+        raise ValueError("Gemini 응답 형식이 올바르지 않습니다.")
+
+    # 누락된 필드 기본값 처리
+    result.setdefault("daily_summary", "")
+    result.setdefault("investment_events", [])
+    result.setdefault("market_signals", [])
+    result.setdefault("linkedin_ideas", [])
+    result.setdefault("learning_notes", [])
+
+    return result
 
 
-# ==========================================
-# 6. HTML 이메일 구성
-# ==========================================
+# ============================================================
+# 6. 이메일 HTML 생성
+# ============================================================
 
 def safe_text(value):
+    if isinstance(value, list):
+        return "<br>".join(
+            html.escape(str(item))
+            for item in value
+        )
+
     return html.escape(str(value or ""))
 
 
-def get_sources(source_ids, articles):
+def source_links(source_ids, article_map):
+    links = []
 
+    for source_id in source_ids or []:
+        article = article_map.get(source_id)
+
+        if article:
+            title = html.escape(article["title"])
+            url = html.escape(article["url"], quote=True)
+
+            links.append(
+                f'<a href="{url}">{title}</a>'
+            )
+
+    if not links:
+        return "연결된 출처 없음"
+
+    return " | ".join(links)
+
+
+def build_email_html(analysis, articles):
     article_map = {
         article["id"]: article
         for article in articles
     }
 
-    sources = []
+    today = datetime.now(KST).strftime("%Y년 %m월 %d일")
 
-    for source_id in source_ids or []:
+    sections = []
 
-        article = article_map.get(source_id)
+    sections.append(f"""
+    <h1>Daily Investment Briefing</h1>
+    <p style="color:#666;">{today} | Impact Investment Research</p>
+    <hr>
+    """)
 
-        if article:
-            sources.append(article)
+    # 오늘의 요약
+    sections.append(f"""
+    <h2>1. 오늘의 핵심 요약</h2>
+    <div style="background:#f5f5f5;padding:16px;border-radius:8px;">
+        {safe_text(analysis.get("daily_summary"))}
+    </div>
+    """)
 
-    return sources
-
-
-def render_source_links(source_ids, articles):
-
-    sources = get_sources(source_ids, articles)
-
-    if not sources:
-        return "<p>참고 기사 확인 필요</p>"
-
-    result = []
-
-    for article in sources:
-
-        result.append(
-            '<p style="margin:5px 0;font-size:13px;">'
-            f'<a href="{safe_text(article["url"])}">'
-            f'{safe_text(article["title"])}</a>'
-            f' <span style="color:#888;">'
-            f'({safe_text(article["source"])})</span></p>'
-        )
-
-    return "".join(result)
-
-
-def render_list(items):
-
-    if not isinstance(items, list) or not items:
-        return "<p>별도 분석 내용 없음</p>"
-
-    return (
-        "<ul>"
-        + "".join(
-            f"<li>{safe_text(item)}</li>"
-            for item in items
-        )
-        + "</ul>"
-    )
-
-
-def build_report(analysis, articles):
-
-    summary = safe_text(
-        analysis.get("daily_summary", "요약 정보 없음")
-    )
-
-    html_body = f"""
-    <h2>오늘의 시장 요약</h2>
-    <p>{summary}</p>
-    """
+    # 투자 이벤트
+    sections.append("<h2>2. 주요 투자 이벤트</h2>")
 
     events = analysis.get("investment_events", [])
 
-    html_body += "<h2>투자 이벤트 및 기업 분석</h2>"
-
     if not events:
-        html_body += "<p>주요 투자 이벤트가 확인되지 않았습니다.</p>"
+        sections.append("<p>주목할 만한 투자 이벤트가 없습니다.</p>")
 
     for index, event in enumerate(events, 1):
+        sections.append(f"""
+        <h3>2-{index}. {safe_text(event.get("title"))}</h3>
+        <p><b>분류:</b> {safe_text(event.get("category"))}</p>
+        <p><b>관련성:</b> {safe_text(event.get("relevance_score"))}/5</p>
 
-        score = event.get("relevance_score", 0)
+        <p><b>확인된 사실</b><br>
+        {safe_text(event.get("confirmed_facts"))}</p>
 
-        try:
-            score = max(1, min(5, int(score)))
-        except (TypeError, ValueError):
-            score = "미평가"
+        <p><b>투자 배경에 대한 가설</b><br>
+        {safe_text(event.get("investment_hypotheses"))}</p>
 
-        html_body += f"""
-        <div style="padding:16px 0;border-bottom:1px solid #ddd;">
+        <p><b>임팩트 분석</b><br>
+        {safe_text(event.get("impact_analysis"))}</p>
 
-        <h3>{index}. {safe_text(event.get("title"))}</h3>
+        <p><b>투자 리스크</b><br>
+        {safe_text(event.get("risks"))}</p>
 
-        <p>
-        <strong>분류:</strong>
-        {safe_text(event.get("category"))}
-        &nbsp; | &nbsp;
-        <strong>관련성:</strong> {score}/5
+        <p><b>추가 확인 사항</b><br>
+        {safe_text(event.get("unknowns"))}</p>
+
+        <p><b>출처:</b>
+        {source_links(event.get("source_ids", []), article_map)}
         </p>
+        <hr>
+        """)
 
-        <h4>확인된 사실</h4>
-        {render_list(event.get("confirmed_facts"))}
+    # 시장 신호
+    sections.append("<h2>3. 시장 신호</h2>")
 
-        <h4>투자 배경에 대한 분석 가설</h4>
-        {render_list(event.get("investment_hypotheses"))}
+    for signal in analysis.get("market_signals", []):
+        sections.append(f"""
+        <h3>{safe_text(signal.get("signal"))}</h3>
+        <p><b>근거:</b><br>
+        {safe_text(signal.get("evidence"))}</p>
 
-        <h4>임팩트 분석</h4>
-        {render_list(event.get("impact_analysis"))}
+        <p><b>투자 관점:</b><br>
+        {safe_text(signal.get("investment_implication"))}</p>
 
-        <h4>엔젤투자자 관점의 리스크</h4>
-        {render_list(event.get("risks"))}
+        <p><b>출처:</b>
+        {source_links(signal.get("source_ids", []), article_map)}
+        </p>
+        """)
 
-        <h4>추가 확인 필요</h4>
-        {render_list(event.get("unknowns"))}
+    # LinkedIn 아이디어
+    sections.append("<h2>4. LinkedIn 포스팅 아이디어</h2>")
 
-        <h4>참고 자료</h4>
-        {render_source_links(event.get("source_ids"), articles)}
+    for idea in analysis.get("linkedin_ideas", []):
+        sections.append(f"""
+        <h3>{safe_text(idea.get("headline"))}</h3>
+        <p><b>핵심 관점:</b><br>
+        {safe_text(idea.get("angle"))}</p>
 
-        </div>
-        """
+        <p><b>생각해 볼 질문:</b><br>
+        {safe_text(idea.get("question"))}</p>
 
-    html_body += "<h2>오늘의 시장 시그널</h2>"
-    html_body += render_list(
-        analysis.get("market_signals")
-    )
+        <p><b>출처:</b>
+        {source_links(idea.get("source_ids", []), article_map)}
+        </p>
+        <hr>
+        """)
 
-    html_body += "<h2>링크드인 포스팅 소재</h2>"
+    # 학습 노트
+    sections.append("<h2>5. 투자 학습 노트</h2>")
 
-    ideas = analysis.get("linkedin_ideas", [])
+    for note in analysis.get("learning_notes", []):
+        sections.append(f"""
+        <h3>{safe_text(note.get("concept"))}</h3>
+        <p><b>개념:</b><br>
+        {safe_text(note.get("explanation"))}</p>
 
-    for index, idea in enumerate(ideas, 1):
+        <p><b>투자 검토에 적용:</b><br>
+        {safe_text(note.get("application"))}</p>
+        """)
 
-        html_body += f"""
-        <div style="padding:12px;background:#f5f7fa;
-                    margin:10px 0;border-radius:6px;">
-
-        <h3>{index}. {safe_text(idea.get("headline"))}</h3>
-
-        <p><strong>접근 관점</strong></p>
-        <p>{safe_text(idea.get("angle"))}</p>
-
-        <p><strong>독자에게 던질 질문</strong></p>
-        <p>{safe_text(idea.get("question"))}</p>
-
-        <p><strong>관련 뉴스</strong></p>
-        {render_source_links(idea.get("source_ids"), articles)}
-
-        </div>
-        """
-
-    html_body += "<h2>오늘의 투자 공부</h2>"
-    html_body += render_list(
-        analysis.get("learning_notes")
-    )
-
-    return html_body
-
-
-def build_sources_section(articles):
-
-    result = "<h2>전체 수집 기사</h2>"
-
-    if not articles:
-        return result + "<p>새로운 기사가 없습니다.</p>"
+    # 원문 기사 목록
+    sections.append("<h2>6. 수집한 원문 기사</h2>")
 
     for article in articles:
+        url = html.escape(article["url"], quote=True)
 
-        result += f"""
-        <p style="font-size:13px;">
-        <a href="{safe_text(article["url"])}">
-        {safe_text(article["title"])}
-        </a><br>
-        <span style="color:#888;">
-        {safe_text(article["source"])}
-        · {safe_text(article["published"][:10])}
-        </span>
+        sections.append(f"""
+        <p>
+        <b>[{safe_text(article["id"])}]</b>
+        <a href="{url}">{safe_text(article["title"])}</a><br>
+        <small>
+        출처: {safe_text(article["source"])}
+        | 발행: {safe_text(article["published"])}
+        </small><br>
+        {safe_text(article["summary"])}
         </p>
-        """
+        """)
 
-    return result
+    sections.append("""
+    <hr>
+    <p style="color:#888;font-size:12px;">
+    본 리포트는 공개 뉴스와 AI 분석을 바탕으로 작성되었습니다.
+    투자 판단 전에는 원문 및 기업의 공식 자료를 확인해야 합니다.
+    AI가 제시한 투자 배경과 시장 전망은 가설이며,
+    검증된 사실과 구분해서 활용하세요.
+    </p>
+    """)
+
+    return f"""
+    <html>
+    <body style="
+        font-family:Arial,sans-serif;
+        line-height:1.65;
+        color:#222;
+        max-width:800px;
+        margin:auto;
+        padding:20px;
+    ">
+    {''.join(sections)}
+    </body>
+    </html>
+    """
 
 
-# ==========================================
+# ============================================================
 # 7. 이메일 발송
-# ==========================================
+# ============================================================
 
-def send_email(subject, html_content, plain_content):
-
+def send_email(subject, html_content):
     if not EMAIL_USER or not EMAIL_APP_PASSWORD:
-        raise ValueError("이메일 환경변수가 등록되지 않았습니다.")
+        raise ValueError(
+            "EMAIL_USER 또는 EMAIL_APP_PASSWORD가 설정되지 않았습니다."
+        )
 
-    msg = MIMEMultipart("alternative")
-
-    msg["From"] = EMAIL_USER
-    msg["To"] = EMAIL_USER
-    msg["Subject"] = subject
-
-    msg.attach(
-        MIMEText(plain_content, "plain", "utf-8")
+    plain_text = re.sub(
+        r"<[^>]+>",
+        " ",
+        html_content
     )
 
-    msg.attach(
-        MIMEText(html_content, "html", "utf-8")
+    plain_text = html.unescape(plain_text)
+    plain_text = re.sub(r"\s+", " ", plain_text)
+
+    message = MIMEMultipart("alternative")
+
+    message["Subject"] = subject
+    message["From"] = EMAIL_USER
+    message["To"] = EMAIL_USER
+
+    message.attach(
+        MIMEText(
+            plain_text,
+            "plain",
+            "utf-8"
+        )
+    )
+
+    message.attach(
+        MIMEText(
+            html_content,
+            "html",
+            "utf-8"
+        )
     )
 
     with smtplib.SMTP_SSL(
         "smtp.gmail.com",
-        465,
-        timeout=30
+        465
     ) as server:
 
         server.login(
@@ -686,147 +766,138 @@ def send_email(subject, html_content, plain_content):
             EMAIL_APP_PASSWORD
         )
 
-        server.send_message(msg)
+        server.sendmail(
+            EMAIL_USER,
+            EMAIL_USER,
+            message.as_string()
+        )
 
-    logging.info("이메일 발송 완료")
+    logger.info("이메일 발송 완료")
 
 
-# ==========================================
-# 8. 프로그램 실행
-# ==========================================
+# ============================================================
+# 8. 예외 상황용 원문 이메일
+# ============================================================
+
+def send_fallback_email(articles, error_message):
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+
+    sections = [
+        "<h1>Daily Investment Briefing</h1>",
+        f"<p>{today}</p>",
+        "<h2>AI 분석에 실패했습니다.</h2>",
+        f"<p>{safe_text(error_message)}</p>",
+        "<p>수집한 원문 기사 목록을 전달합니다.</p>",
+        "<hr>"
+    ]
+
+    for article in articles:
+        url = html.escape(article["url"], quote=True)
+
+        sections.append(f"""
+        <h3>
+        <a href="{url}">{safe_text(article["title"])}</a>
+        </h3>
+        <p>
+        출처: {safe_text(article["source"])}<br>
+        발행: {safe_text(article["published"])}
+        </p>
+        <p>{safe_text(article["summary"])}</p>
+        <hr>
+        """)
+
+    html_content = f"""
+    <html>
+    <body style="font-family:Arial,sans-serif;line-height:1.6;padding:20px;">
+    {''.join(sections)}
+    </body>
+    </html>
+    """
+
+    send_email(
+        f"[투자 브리핑] {today} - AI 분석 실패 / 원문 전달",
+        html_content
+    )
+
+
+# ============================================================
+# 9. 메인 실행
+# ============================================================
 
 def main():
+    logger.info("=" * 50)
+    logger.info("Daily Investment Briefing 시작")
+    logger.info("모델: %s", GEMINI_MODEL)
+    logger.info("=" * 50)
 
-    logging.info("데일리 투자 리서치 시작")
+    if not EMAIL_USER or not EMAIL_APP_PASSWORD:
+        raise ValueError("이메일 환경변수를 확인하세요.")
 
     processed_urls = load_history()
 
-    # 뉴스 수집
     articles = fetch_latest_news(processed_urls)
 
     today = datetime.now(KST).strftime("%Y-%m-%d")
 
-    subject = (
-        f"[Daily Impact Investment Briefing] {today}"
-    )
-
-    # 수집된 기사가 없는 경우
+    # 신규 기사가 없는 경우
     if not articles:
-
-        html_body = """
-        <h2>오늘은 새로운 수집 기사가 없습니다.</h2>
-        <p>최근 72시간 내 새로운 뉴스가 없거나
-        기존에 처리한 기사만 확인되었습니다.</p>
-        """
+        logger.info("신규 기사가 없습니다.")
 
         send_email(
-            subject,
-            html_body,
-            "오늘은 새로운 수집 기사가 없습니다."
+            f"[투자 브리핑] {today} - 신규 기사 없음",
+            """
+            <html>
+            <body>
+            <h2>Daily Investment Briefing</h2>
+            <p>최근 72시간 이내에 새롭게 수집된 기사가 없습니다.</p>
+            </body>
+            </html>
+            """
         )
 
         return
 
-    logging.info("AI 분석 시작")
-
+    # Gemini 분석
     try:
+        analysis = analyze_news_with_gemini(articles)
 
-        analysis = analyze_with_groq(articles)
-
-        report_html = build_report(
+        html_content = build_email_html(
             analysis,
             articles
         )
 
-        analysis_success = True
-
-        plain_content = (
-            "오늘의 투자 리서치 보고서입니다. "
-            "HTML 이메일로 확인해 주세요."
+        send_email(
+            f"[투자 브리핑] {today} - {len(articles)}개 기사 분석",
+            html_content
         )
 
-    except Exception as error:
-
-        logging.exception("AI 분석 실패")
-
-        analysis_success = False
-
-        report_html = f"""
-        <h2>AI 분석에 실패했습니다.</h2>
-        <p>오류: {safe_text(error)}</p>
-        <p>수집된 원문 기사 목록을 아래에서 확인해 주세요.</p>
-        """
-
-        plain_content = (
-            "AI 분석에 실패했습니다. "
-            "아래 원문 기사 목록을 확인해 주세요."
-        )
-
-    final_html = f"""
-    <div style="
-        font-family:Arial,'Malgun Gothic',sans-serif;
-        max-width:760px;
-        margin:0 auto;
-        padding:24px;
-        color:#24292e;
-        line-height:1.7;
-    ">
-
-        <h1 style="color:#1f497d;">
-        Daily Impact Investment Briefing
-        </h1>
-
-        <p style="color:#777;">
-        {today} · Personal Investment Research
-        </p>
-
-        <hr>
-
-        {report_html}
-
-        <hr>
-
-        {build_sources_section(articles)}
-
-        <hr>
-
-        <p style="font-size:12px;color:#888;">
-        Powered by GitHub Actions & Groq AI
-        <br>
-        개인 리서치 참고 자료이며 투자 권유가 아닙니다.
-        </p>
-
-    </div>
-    """
-
-    logging.info("이메일 발송 시작")
-
-    send_email(
-        subject,
-        final_html,
-        plain_content
-    )
-
-    # AI 분석과 이메일 발송이 모두 성공한 경우에만
-    # 기존 처리 기록에 새로운 기사를 추가
-    if analysis_success:
-
+        # 이메일 발송 성공 후에만 처리 이력 저장
         for article in articles:
             processed_urls.add(article["url"])
 
         save_history(processed_urls)
 
-        logging.info("기사 처리 기록 저장 완료")
+        logger.info("분석 및 발송 완료")
 
-    else:
+    except Exception as error:
+        logger.exception("Gemini 분석 또는 이메일 발송 실패")
 
-        logging.warning(
-            "AI 분석 실패: 다음 실행에서 재처리합니다."
-        )
+        # 원문 전달 시도
+        try:
+            send_fallback_email(
+                articles,
+                str(error)
+            )
 
-    logging.info("프로그램 종료")
+            logger.info("원문 전달 이메일 발송 완료")
+
+        except Exception:
+            logger.exception("원문 이메일 발송도 실패")
+
+        # 처리 이력에는 저장하지 않음.
+        # 다음 실행에서 다시 분석할 수 있도록 유지.
+        raise
 
 
 if __name__ == "__main__":
-
     main()
